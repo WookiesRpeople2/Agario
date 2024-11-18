@@ -1,12 +1,24 @@
 import { model, Schema } from "mongoose";
 
-export const invintory = model(
+export const Invintory = model(
   "Invintory",
   new Schema({
     userId: {
       type: Schema.Types.ObjectId,
       ref: "User",
       required: true,
+    },
+    experience: {
+      type: Number,
+      default: 0,
+    },
+    level: {
+      type: Number,
+      default: 1,
+    },
+    coins: {
+      type: Number,
+      default: 0,
     },
     skins: [
       {

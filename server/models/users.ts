@@ -29,18 +29,6 @@ export const Users = model(
         providerData: Schema.Types.Mixed,
       },
     ],
-    experience: {
-      type: Number,
-      default: 0,
-    },
-    level: {
-      type: Number,
-      default: 1,
-    },
-    coins: {
-      type: Number,
-      default: 0,
-    },
     createdAt: {
       type: Date,
       default: Date.now,
