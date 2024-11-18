@@ -1,14 +1,20 @@
 import { z } from "zod";
-import { urlvalidator } from "./lib/validators";
+import { stringValidator, urlvalidator } from "./lib/validators";
 
 const configSchema = z.object({
+  db: z.object({
+    mongoUrl: urlvalidator,
+  }),
   ports: z.object({
-    appPort: urlvalidator,
+    appPort: stringValidator,
   }),
 });
 type ConfigType = z.infer<typeof configSchema>;
 
 const values: ConfigType = {
+  db: {
+    mongoUrl: process.env.MONGO_URL!,
+  },
   ports: {
     appPort: process.env.PORT!,
   },
