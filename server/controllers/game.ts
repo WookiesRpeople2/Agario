@@ -1,252 +1,401 @@
 import { Server, Socket } from "socket.io";
-import { Server as HTTPServer } from "http";
 import { Types } from "mongoose";
 import { Skins } from "../models/skins";
 import { Invintory } from "../models/invintory";
 import { gameSession } from "../models/gameSession";
-import { socketAuthMiddleware } from "../middlewares/auth";
+import { isValidMongoIdSocket } from "../middlewares/isValidMongoId";
+import crypto from "node:crypto";
+import type { Position, PlayerState, FoodItem } from "../types";
 
-type Position = {
-  x: number;
-  y: number;
+const GAME_CONSTANTS = {
+  INITIAL_SIZE: 10,
+  MAP_WIDTH: 1000,
+  MAP_HEIGHT: 1000,
+  MIN_SIZE_TO_EAT: 1.2,
+  EAT_SIZE_MULTIPLIER: 5,
+  EXPERIENCE_MULTIPLIER: 10,
+  COIN_MULTIPLIER: 5,
+  LEVEL_UP_EXPERIENCE: 100,
+  GAME_END_COINS: 50,
+  LEVEL_UP_BONUS: 20,
+  MOVE_RATE_LIMIT: 50,
+  FOOD_SIZE: 5,
+  FOOD_COUNT: 100,
+  FOOD_EXPERIENCE: 5,
+  FOOD_GROWTH: 0.5,
+  FOOD_SPAWN_INTERVAL: 1000,
+} as const;
+
+const isValidPosition = (position: Position): boolean => {
+  return (
+    typeof position.x === "number" &&
+    typeof position.y === "number" &&
+    position.x >= 0 &&
+    position.x <= GAME_CONSTANTS.MAP_WIDTH &&
+    position.y >= 0 &&
+    position.y <= GAME_CONSTANTS.MAP_HEIGHT
+  );
 };
 
-type PlayerState = {
-  id: string;
-  position: Position;
-  size: number;
-  skinId?: Types.ObjectId;
-  sessionId: Types.ObjectId;
+const handleError = (socket: Socket, error: unknown, message: string) => {
+  console.error(`${message}:`, error);
+  socket.emit("error", message);
 };
 
-type ServerToClientEvents = {
-  error: (message: string) => void;
-  player_joined: (player: PlayerState) => void;
-  game_state: (players: PlayerState[]) => void;
-  player_moved: (data: { id: string; position: Position }) => void;
-  player_eaten: (data: { eaterId: string; eatenId: string }) => void;
-  game_over: () => void;
-  skin_purchased: (data: { skinId: Types.ObjectId; price: number }) => void;
-  player_skin_changed: (data: {
-    playerId: string;
-    skinId: Types.ObjectId;
-  }) => void;
-  player_left: (playerId: string) => void;
+const generateRandomPosition = (): Position => {
+  return {
+    x: Math.random() * GAME_CONSTANTS.MAP_WIDTH,
+    y: Math.random() * GAME_CONSTANTS.MAP_HEIGHT,
+  };
 };
 
-type ClientToServerEvents = {
-  join_game: () => void;
-  move: (position: Position) => void;
-  eat_player: (eatenPlayerId: string) => void;
-  purchase_skin: (skinId: string) => void;
-  equip_skin: (skinId: string) => void;
-  end_game: () => void;
+const canEatPlayer = (eater: PlayerState, eaten: PlayerState): boolean => {
+  return eater.size >= eaten.size * GAME_CONSTANTS.MIN_SIZE_TO_EAT;
 };
 
-type InterServerEvents = {
-  ping: () => void;
+const calculateRewards = (eatenSize: number) => {
+  return {
+    experience: Math.floor(eatenSize) * GAME_CONSTANTS.EXPERIENCE_MULTIPLIER,
+    coins: Math.floor(eatenSize) * GAME_CONSTANTS.COIN_MULTIPLIER,
+  };
 };
 
-export const initializeSocketControllers = (server: HTTPServer) => {
-  const io = new Server<
-    ClientToServerEvents,
-    ServerToClientEvents,
-    InterServerEvents
-  >(server, {
-    cors: {
-      origin: "http://localhost:5173",
-      credentials: true,
-      methods: ["GET", "POST", "PUT", "DELETE"],
-    },
-  });
+const isRateLimited = (player: PlayerState): boolean => {
+  const now = Date.now();
+  if (now - player.lastUpdate < GAME_CONSTANTS.MOVE_RATE_LIMIT) {
+    return true;
+  }
+  player.lastUpdate = now;
+  return false;
+};
 
-  const activePlayers: Map<string, PlayerState> = new Map();
+export class GameHandlers {
+  private activePlayers: Map<string, PlayerState>;
+  private activeFood: Map<string, FoodItem>;
+  private io: Server;
+  private foodSpawnInterval: NodeJS.Timer | null;
 
-  io.use(socketAuthMiddleware);
+  constructor(io: Server) {
+    this.activePlayers = new Map();
+    this.activeFood = new Map();
+    this.io = io;
+    this.foodSpawnInterval = null;
+  }
 
-  io.on("connection", (socket: Socket) => {
-    const userId = socket.user._id;
-    console.log("connected: ", userId);
+  private spawnFood(): void {
+    const foodItem: FoodItem = {
+      id: crypto.randomUUID(),
+      position: generateRandomPosition(),
+      size: GAME_CONSTANTS.FOOD_SIZE,
+    };
 
-    socket.on("join_game", async () => {
-      try {
-        const session = await gameSession.create({
-          userId: socket.user._id,
-          startTime: new Date(),
-        });
+    this.activeFood.set(foodItem.id, foodItem);
+    this.io.emit("food_spawned", foodItem);
+  }
 
-        const inventory = await Invintory.findOne({ userId: socket.user._id });
-        const equippedSkin = inventory?.skins.find((skin) => skin.equipped);
+  private checkFoodCollision(player: PlayerState): FoodItem | null {
+    for (const [foodId, food] of this.activeFood) {
+      const distance = Math.sqrt(
+        Math.pow(player.position.x - food.position.x, 2) +
+          Math.pow(player.position.y - food.position.y, 2)
+      );
 
-        const playerState: PlayerState = {
-          id: userId,
-          position: { x: Math.random() * 1000, y: Math.random() * 1000 },
-          size: 10,
-          skinId: equippedSkin?.skinId,
-          sessionId: session._id,
-        };
-
-        activePlayers.set(userId, playerState);
-        socket.broadcast.emit("player_joined", playerState);
-        socket.emit("game_state", Array.from(activePlayers.values()));
-      } catch (error) {
-        socket.emit("error", "Failed to join game");
+      if (distance < player.size) {
+        return food;
       }
-    });
+    }
+    return null;
+  }
 
-    socket.on("move", (position: Position) => {
-      const player = activePlayers.get(userId);
-      if (player) {
-        player.position = position;
-        socket.broadcast.emit("player_moved", {
-          id: userId,
-          position: position,
-        });
+  joinGame = async (socket: Socket): Promise<void> => {
+    try {
+      const userId = socket.user._id;
+
+      if (this.activePlayers.get(userId)) {
+        return;
       }
-    });
 
-    socket.on("eat_player", async (eatenPlayerId: string) => {
-      try {
-        const eater = activePlayers.get(userId);
-        const eaten = activePlayers.get(eatenPlayerId);
+      const session = await gameSession.create({
+        userId,
+        startTime: new Date(),
+      });
 
-        if (eater && eaten && eater.size > eaten.size) {
-          eater.size += eaten.size * 0.5;
-
-          const sizeBonus = Math.floor(eaten.size);
-          await Invintory.findOneAndUpdate(
-            { userId: socket.user._id },
-            {
-              $inc: {
-                experience: sizeBonus * 10,
-                coins: sizeBonus * 5,
-              },
-            }
-          );
-
-          activePlayers.delete(eatenPlayerId);
-          io.to(eatenPlayerId).emit("game_over");
-          io.emit("player_eaten", { eaterId: userId, eatenId: eatenPlayerId });
-        }
-      } catch (error) {
-        socket.emit("error", "Failed to process player collision");
+      const inventory = await Invintory.findOne({ userId });
+      if (!inventory) {
+        throw new Error("User inventory not found");
       }
-    });
 
-    socket.on("purchase_skin", async (skinId: string) => {
-      try {
-        const skin = await Skins.findById(skinId);
-        const inventory = await Invintory.findOne({ userId: socket.user._id });
+      const equippedSkin = inventory.skins.find((skin) => skin.equipped);
 
-        if (skin && inventory && inventory.coins >= skin.price) {
-          await Invintory.findOneAndUpdate(
-            { userId: socket.user._id },
-            {
-              $push: {
-                skins: {
-                  skinId: new Types.ObjectId(skinId),
-                  acquired: new Date(),
-                },
-              },
-              $inc: { coins: -skin.price },
-            }
-          );
-          socket.emit("skin_purchased", {
-            skinId: new Types.ObjectId(skinId),
-            price: skin.price,
-          });
-        } else {
-          socket.emit("error", "Insufficient coins or invalid skin");
-        }
-      } catch (error) {
-        socket.emit("error", "Failed to purchase skin");
+      const playerState: PlayerState = {
+        id: userId,
+        position: generateRandomPosition(),
+        size: GAME_CONSTANTS.INITIAL_SIZE,
+        skinId: equippedSkin?.skinId!,
+        sessionId: session._id,
+        lastUpdate: Date.now(),
+      };
+
+      this.activePlayers.set(userId, playerState);
+      socket.broadcast.emit("player_joined", playerState);
+      socket.emit(
+        "game_state",
+        Array.from(this.activePlayers.values()),
+        userId
+      );
+    } catch (error) {
+      handleError(socket, error, "Failed to join game");
+    }
+  };
+
+  handleEatFood = async (socket: Socket): Promise<void> => {
+    try {
+      const userId = socket.user._id;
+      const player = this.activePlayers.get(userId);
+
+      if (this.activePlayers.has(userId)) {
+        return;
       }
-    });
 
-    socket.on("equip_skin", async (skinId: string) => {
-      try {
-        await Invintory.findOneAndUpdate(
-          {
-            userId: socket.user._id,
-            "skins.skinId": new Types.ObjectId(skinId),
+      if (!player) {
+        return;
+      }
+
+      const collidedFood = this.checkFoodCollision(player);
+      if (!collidedFood) {
+        return;
+      }
+
+      this.activeFood.delete(collidedFood.id);
+      player.size += GAME_CONSTANTS.FOOD_GROWTH;
+
+      await Invintory.findOneAndUpdate(
+        { userId },
+        {
+          $inc: {
+            experience: GAME_CONSTANTS.FOOD_EXPERIENCE,
           },
-          {
-            $set: {
-              "skins.$.equipped": true,
-              "skins.$[other].equipped": false,
+        }
+      );
+
+      this.io.emit("food_eaten", {
+        foodId: collidedFood.id,
+        playerId: userId,
+        newSize: player.size,
+      });
+    } catch (error) {
+      handleError(socket, error, "Did not eat");
+    }
+  };
+
+  handleSetFood = (): void => {
+    this.foodSpawnInterval = setInterval(() => {
+      if (this.activeFood.size < GAME_CONSTANTS.FOOD_COUNT) {
+        this.spawnFood();
+      }
+    }, GAME_CONSTANTS.FOOD_SPAWN_INTERVAL);
+  };
+
+  handleMove = async (socket: Socket, position: Position): Promise<void> => {
+    try {
+      const userId = socket.user._id;
+      const player = this.activePlayers.get(userId);
+
+      if (!player) {
+        throw new Error("Player not found");
+      }
+
+      if (!isValidPosition(position)) {
+        throw new Error("Invalid position");
+      }
+
+      if (isRateLimited(player)) {
+        return;
+      }
+
+      player.position = position;
+      socket.broadcast.emit("player_moved", { id: userId, position });
+      socket.emit("player_moved", { id: userId, position });
+    } catch (error) {
+      handleError(socket, error, "Failed to process movement");
+    }
+  };
+
+  handleEatPlayer = async (
+    socket: Socket,
+    eatenPlayerId: string
+  ): Promise<void> => {
+    try {
+      const eaterId = socket.user._id;
+      const eater = this.activePlayers.get(eaterId);
+      const eaten = this.activePlayers.get(eatenPlayerId);
+
+      if (!eater || !eaten) {
+        throw new Error(
+          `Player not found: eater ${eaterId}, eaten ${eatenPlayerId}`
+        );
+      }
+
+      if (canEatPlayer(eater, eaten)) {
+        return;
+      }
+
+      eater.size += eaten.size * GAME_CONSTANTS.EAT_SIZE_MULTIPLIER;
+      const rewards = calculateRewards(eaten.size);
+
+      await Invintory.findOneAndUpdate({ userId: eaterId }, { $inc: rewards });
+
+      this.activePlayers.delete(eatenPlayerId);
+      this.io.to(eatenPlayerId).emit("game_over");
+      this.io.emit("player_eaten", { eaterId, eatenId: eatenPlayerId });
+    } catch (error) {
+      handleError(socket, error, "Failed to process player collision");
+    }
+  };
+
+  handlePurchaseSkin = async (
+    socket: Socket,
+    skinId: string
+  ): Promise<void> => {
+    try {
+      if (!isValidMongoIdSocket(socket, skinId)) {
+        throw new Error("Invalid skin ID");
+      }
+
+      const userId = socket.user._id;
+      const [skin, inventory] = await Promise.all([
+        Skins.findById(skinId),
+        Invintory.findOne({ userId }),
+      ]);
+
+      if (!skin || !inventory) {
+        throw new Error("Skin or inventory not found");
+      }
+
+      if (inventory.coins < skin.price) {
+        throw new Error("Insufficient coins");
+      }
+
+      await Invintory.findOneAndUpdate(
+        { userId },
+        {
+          $push: {
+            skins: {
+              skinId: new Types.ObjectId(skinId),
+              acquired: new Date(),
+              equipped: false,
             },
           },
-          {
-            arrayFilters: [
-              { "other.skinId": { $ne: new Types.ObjectId(skinId) } },
-            ],
-          }
-        );
-
-        const player = activePlayers.get(userId);
-        if (player) {
-          player.skinId = new Types.ObjectId(skinId);
-          io.emit("player_skin_changed", {
-            playerId: userId,
-            skinId: new Types.ObjectId(skinId),
-          });
+          $inc: { coins: -skin.price },
         }
-      } catch (error) {
-        socket.emit("error", "Failed to equip skin");
+      );
+
+      socket.emit("skin_purchased", {
+        skinId: new Types.ObjectId(skinId),
+        price: skin.price,
+      });
+    } catch (error) {
+      handleError(socket, error, "Failed to purchase skin");
+    }
+  };
+
+  handleEquipSkin = async (socket: Socket, skinId: string): Promise<void> => {
+    try {
+      if (!isValidMongoIdSocket(socket, skinId)) {
+        throw new Error("Invalid skin ID");
       }
-    });
 
-    socket.on("end_game", async () => {
-      // try {
-      //   const player = activePlayers.get(userId);
-      //   if (player) {
-      //     const session = await gameSession.findById(player.sessionId);
-      //     if (session) {
-      //       session.endTime = new Date();
-      //       session.score = player.size;
-      //       session.maxSize = player.size;
-      //       session.timeAlive =
-      //         (session.endTime.getTime() - session.startTime.getTime()) / 1000;
-      //       await session.save();
-      //     }
-      //     const invintory = await Invintory.findById(player.sessionId);
-      //     if (invintory) {
-      //       const updateInvintory = {
-      //         level:
-      //           invintory.experience >= 100
-      //             ? invintory.experience + 1
-      //             : invintory?.level,
-      //         experience:
-      //           invintory.experience >= 100
-      //             ? invintory.experience + 20
-      //             : (invintory.experience = 0),
-      //         coins: invintory.coins + 50,
-      //       };
-      //       invintory.updateOne(updateInvintory);
-      //     }
-      //     activePlayers.delete(userId);
-      //     socket.broadcast.emit("player_left", userId);
-      //   }
-      // } catch (error) {
-      //   socket.emit("error", "Failed to end game session");
-      // }
-    });
+      const userId = socket.user._id;
+      const player = this.activePlayers.get(userId);
 
-    socket.on("disconnect", async () => {
-      try {
-        const player = activePlayers.get(userId);
-        if (player) {
-          await gameSession.findByIdAndUpdate(player.sessionId, {
-            endTime: new Date(),
-          });
-          activePlayers.delete(userId);
-          io.emit("player_left", userId);
+      await Invintory.findOneAndUpdate(
+        {
+          userId,
+          "skins.skinId": new Types.ObjectId(skinId),
+        },
+        {
+          $set: {
+            "skins.$.equipped": true,
+            "skins.$[other].equipped": false,
+          },
+        },
+        {
+          arrayFilters: [
+            { "other.skinId": { $ne: new Types.ObjectId(skinId) } },
+          ],
         }
-      } catch (error) {
-        console.error("Disconnect handler error:", error);
-      }
-    });
-  });
+      );
 
-  return io;
-};
+      if (player) {
+        player.skinId = new Types.ObjectId(skinId);
+        this.io.emit("player_skin_changed", {
+          playerId: userId,
+          skinId: new Types.ObjectId(skinId),
+        });
+      }
+    } catch (error) {
+      handleError(socket, error, "Failed to equip skin");
+    }
+  };
+
+  handleEndGame = async (socket: Socket): Promise<void> => {
+    try {
+      const userId = socket.user._id;
+      const player = this.activePlayers.get(userId);
+
+      if (!player) {
+        throw new Error("Player not found");
+      }
+
+      const session = await gameSession.findById(player.sessionId);
+      if (session) {
+        const endTime = new Date();
+        const timeAlive =
+          (endTime.getTime() - session.startTime.getTime()) / 1000;
+
+        await session.updateOne({
+          endTime,
+          score: player.size,
+          maxSize: player.size,
+          timeAlive,
+        });
+      }
+
+      const inventory = await Invintory.findOne({ userId });
+      if (inventory) {
+        const shouldLevelUp =
+          inventory.experience >= GAME_CONSTANTS.LEVEL_UP_EXPERIENCE;
+        await inventory.updateOne({
+          $inc: {
+            level: shouldLevelUp ? 1 : 0,
+            experience: shouldLevelUp ? GAME_CONSTANTS.LEVEL_UP_BONUS : 0,
+            coins: GAME_CONSTANTS.GAME_END_COINS,
+          },
+        });
+      }
+
+      this.activePlayers.delete(userId);
+      socket.broadcast.emit("player_left", userId);
+    } catch (error) {
+      handleError(socket, error, "Failed to end game session");
+    }
+  };
+
+  handleDisconnect = async (socket: Socket): Promise<void> => {
+    try {
+      const userId = socket.user._id;
+      const player = this.activePlayers.get(userId);
+
+      if (player) {
+        await gameSession.findByIdAndUpdate(player.sessionId, {
+          endTime: new Date(),
+        });
+
+        this.activePlayers.delete(userId);
+        this.io.emit("player_left", userId);
+      }
+    } catch (error) {
+      console.error("Disconnect handler error:", error);
+    }
+  };
+}

@@ -2,13 +2,17 @@ import { z } from "zod";
 
 export const urlvalidator = z.string().url();
 
-export const stringValidator = z.string().min(3);
+export const stringValidator = z.string();
 
 export const numberValidator = z.number();
 
 export const emailValidator = z.string().email();
 
 export const passwordValidator = z.string().min(6);
+
+export const booleanValidator = z.boolean();
+
+export const arrayValidator = (type: z.ZodType) => z.array(type);
 
 export const providerDataValidator = z.object({
   id: z.string(),

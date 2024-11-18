@@ -1,6 +1,11 @@
 import "dotenv/config";
 import { z } from "zod";
-import { stringValidator, urlvalidator } from "./lib/validators";
+import {
+  arrayValidator,
+  booleanValidator,
+  stringValidator,
+  urlvalidator,
+} from "./lib/validators";
 
 const configSchema = z.object({
   db: z.object({
@@ -14,10 +19,10 @@ const configSchema = z.object({
     jwtSecret: stringValidator,
   }),
   cors: z.object({
-    origin: z.string().array(),
-    methods: z.string().array(),
-    credentials: z.boolean(),
-    allowedHeaders: z.string().array(),
+    origin: arrayValidator(stringValidator),
+    methods: arrayValidator(stringValidator),
+    credentials: booleanValidator,
+    allowedHeaders: arrayValidator(stringValidator),
   }),
 });
 type ConfigType = z.infer<typeof configSchema>;
@@ -36,7 +41,7 @@ const values: ConfigType = {
   cors: {
     origin: process.env.CORS_ORIGIN!.split(","),
     methods: process.env.CORS_ALLOWED_METHODES!.split(","),
-    credentials: Boolean(process.env.CORS_CREDENTIALS!),
+    credentials: process.env.CORS_CREDENTIALS! == "true" ? true : false,
     allowedHeaders: process.env.CORS_ALLOWED_HEADERS!.split(","),
   },
 };
